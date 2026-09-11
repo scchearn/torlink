@@ -1,10 +1,10 @@
 import { execFileSync, spawn, execFile } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, rmdirSync, unlinkSync } from "node:fs";
-import net from "node:net";
+import { existsSync, readdirSync, rmdirSync, unlinkSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import chromecasts from "chromecasts";
+import { startOnDemandServer, type SegmentPlan } from "./castServer";
 
 // ponytail: fixed local players; AirPlay via pyatv CLI helper (no native Node deps).
 // macOS app bundles (VLC, IINA) aren't on PATH, so probe bundle paths too.
@@ -152,6 +152,7 @@ function probeVideoCodec(url: string): Promise<string | null> {
 
 interface ProbedStream {
   vcodec: string | null;
+  durationSec: number | null;
   audioLangs: string[]; // per audio stream, language tag or ""
 }
 
@@ -159,14 +160,17 @@ function probeStreams(url: string): Promise<ProbedStream | null> {
   return new Promise((resolve) => {
     execFile(
       "ffprobe",
-      ["-v", "error", "-show_entries", "stream=codec_name,codec_type:stream_tags=language", "-of", "json", url],
+      ["-v", "error", "-show_entries", "stream=codec_name,codec_type:stream_tags=language:format=duration", "-of", "json", url],
       { timeout: 15000 },
       (err, stdout) => {
         if (err) return resolve(null);
         try {
-          const streams = JSON.parse(stdout).streams ?? [];
+          const parsed = JSON.parse(stdout);
+          const streams = parsed.streams ?? [];
+          const duration = Number(parsed.format?.duration);
           resolve({
             vcodec: streams.find((s: { codec_type?: string }) => s.codec_type === "video")?.codec_name ?? null,
+            durationSec: Number.isFinite(duration) ? duration : null,
             audioLangs: streams
               .filter((s: { codec_type?: string }) => s.codec_type === "audio")
               .map((s: { tags?: { language?: string } }) => s.tags?.language ?? ""),
@@ -179,26 +183,14 @@ function probeStreams(url: string): Promise<ProbedStream | null> {
   });
 }
 
-function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.listen(0, "0.0.0.0", () => {
-      const port = (srv.address() as net.AddressInfo).port;
-      srv.close(() => resolve(port));
-    });
-    srv.on("error", reject);
-  });
-}
-
-// One transcode at a time: a new cast kills the previous ffmpeg/server and
-// deletes its temp dir. Concurrent transcodes of the same in-progress torrent
-// starve each other (three readers thrash the piece cache) and fill disk.
-let activeTranscode: { ff: ReturnType<typeof spawn>; srv: ReturnType<typeof spawn>; dir: string } | null = null;
+// One cast server at a time: a new cast stops the previous one and deletes its
+// temp dir. Concurrent transcodes of the same in-progress torrent starve each
+// other (three readers thrash the piece cache) and fill disk.
+let activeTranscode: { stop: () => void; dir: string } | null = null;
 
 function stopActiveTranscode(): void {
   if (!activeTranscode) return;
-  activeTranscode.ff.kill("SIGKILL");
-  activeTranscode.srv.kill("SIGKILL");
+  activeTranscode.stop();
   removeDir(activeTranscode.dir);
   activeTranscode = null;
 }
@@ -233,59 +225,64 @@ export function buildVarStreamMap(audioLangs: string[]): { map: string; defaultI
   return { map: parts.join(" "), defaultIdx: 0 };
 }
 
-// Transcode to HLS in a temp dir served by python's stdlib http.server; returns
-// the playlist URL only after the first segments exist, so the ATV never sees
-// an empty playlist. ffmpeg/server are children of this process (not detached),
-// so they die with torlnk. // ponytail: disk holds the full remux (~bitrate ×
-// runtime); switch to delete_segments live mode if that matters.
+// Start the on-demand cast server for one cast: a complete VOD playlist is
+// written instantly (full scrub bar, native ATV seeking) and each 2s segment
+// is transcoded the first time the receiver requests it — mpv-style. Only
+// watched content is ever computed.
 async function airplayTranscode(
   url: string,
   video: "copy" | "encode",
   audioLangs: string[],
   onStatus?: CastStatusSink,
+  startSec = 0,
+  durationSec: number | null = null,
 ): Promise<string> {
   onStatus?.({ state: "transcoding" });
   stopActiveTranscode();
   cleanStaleTranscodeDirs();
-  const dir = path.join(tmpdir(), `torlnk-cast-${Date.now()}`);
-  mkdirSync(dir, { recursive: true });
-  const port = await freePort();
-  const videoArgs = video === "copy" ? ["-c:v", "copy"] : ["-c:v", "libx264", "-preset", "veryfast"];
-  // ponytail: mpegts over fmp4 — the only variant this ATV (AppleTV5,3/tvOS 26) actually plays.
-  // -readrate 1.5: transcode must outpace playback or the ATV's buffer drains
-  // (stutter) on Wi-Fi/torrent hiccups; EVENT playlist keeps all segments so the
-  // faster pace doesn't move the join point.
-  // Audio goes out as per-track renditions so the ATV's audio menu can switch languages.
-  const { map } = buildVarStreamMap(audioLangs);
-  const args = ["-y", "-readrate", "1.5", "-i", url, "-map", "0:v:0"];
-  for (let i = 0; i < audioLangs.length; i++) args.push("-map", `0:a:${i}`);
-  args.push(...videoArgs, "-c:a", "aac", "-b:a", "192k", "-ac", "2",
-    "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "event",
-    "-hls_segment_type", "mpegts", "-master_pl_name", "master.m3u8",
-    "-var_stream_map", map, path.join(dir, "%v", "stream.m3u8"));
-  const ff = spawn("ffmpeg", args, { stdio: "ignore" });
-  ff.on("error", () => {});
-  const srv = spawn("python3", ["-m", "http.server", String(port), "--bind", "0.0.0.0", "--directory", dir], {
-    stdio: "ignore",
-  });
-  srv.on("error", () => {});
-  activeTranscode = { ff, srv, dir };
-  // Wait until ffmpeg has written the master playlist (it appears after all
-  // variant playlists have segments) or died.
-  const master = path.join(dir, "master.m3u8");
-  for (let i = 0; i < 150; i++) {
-    if (ff.exitCode !== null) throw new Error("ffmpeg failed to transcode (is it installed?)");
-    if (existsSync(master)) break;
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  if (!existsSync(master)) throw new Error("transcode did not produce a playlist in time");
+  if (!durationSec) throw new Error("cannot determine media duration");
+  const plan: SegmentPlan = { sourceUrl: url, durationSec, audioLangs, video, startSec };
   const ip = lanIp() ?? "127.0.0.1";
-  return `http://${ip}:${port}/master.m3u8`;
+  const server = await startOnDemandServer(plan, ip, (pct) => {
+    onStatus?.({ state: "transcoding", detail: `${pct}%` });
+  });
+  activeTranscode = { stop: server.stop, dir: server.dir };
+  return server.url;
 }
 
-// Stop the active cast (kills transcode processes, frees the temp dir). Safe to
-// call when nothing is active. Exposed so the UI can offer a stop key.
+// The AirPlay cast currently active: which helper process is playing and on
+// which device, so `S` can kill the helper AND tear the ATV session down.
+// Null when the active cast is Chromecast (whose stop is just killing the
+// transcode, or nothing at all).
+let activeAirplayCast: {
+  pyBin: string;
+  helperScript: string;
+  id: string;
+  env: NodeJS.ProcessEnv;
+  helper: ReturnType<typeof spawn> | null;
+} | null = null;
+
+// Stop the active cast. Two-step teardown: kill the play helper (its session
+// watcher hangs once the RTSP channel dies, so it must not outlive us), then
+// run `airplay.py stop` to make the ATV drop playback cleanly. Safe to call
+// when nothing is active.
 export function stopActiveCast(): void {
+  const cast = activeAirplayCast;
+  activeAirplayCast = null;
+  if (cast) {
+    // Kill the play helper first so it can't reconnect or linger.
+    try {
+      cast.helper?.kill("SIGTERM");
+    } catch {}
+    // Best-effort session teardown on the device itself.
+    try {
+      const proc = spawn(cast.pyBin, [cast.helperScript, "stop", cast.id], {
+        stdio: "ignore", detached: true, env: cast.env,
+      });
+      proc.on("error", () => {});
+      proc.unref();
+    } catch {}
+  }
   stopActiveTranscode();
 }
 
@@ -310,6 +307,128 @@ export function findHelperScript(): string {
     dir = parent;
   }
   return path.join("scripts", "airplay.py");
+}
+
+// Run the airplay helper for one device: resolve → probe → transcode → spawn
+// `play`. The helper keeps stderr; on failure its TORLNK_ERR line becomes the
+// status detail. The play process is detached so playback survives torlnk.
+// Seek handling: the helper reports the receiver's position as POS:<sec> lines
+// on stdout. When the user scrubs past the transcode edge (content that doesn't
+// exist yet), we restart the transcode at the target position and recast —
+// the same approach Plex/Jellyfin use, with a brief reload on the TV.
+// With the on-demand server, the ATV natively seeks anywhere (the playlist is
+// a full VOD), so the runCycle restart machinery only remains for the UI
+// seek keys; the receiver-driven seek detection is gone.
+function castViaHelper(
+  pyBin: string,
+  helperScript: string,
+  id: string,
+  url: string,
+  env: NodeJS.ProcessEnv,
+  onStatus?: CastStatusSink,
+): void {
+  void (async () => {
+    try {
+      onStatus?.({ state: "preparing" });
+      const ip = lanIp();
+      const castUrl = ip ? url.replace("127.0.0.1", ip) : url;
+      const fileUrl = await resolveFileUrl(castUrl, ip ?? "127.0.0.1");
+      const probe = await probeStreams(fileUrl);
+      const plan = airplayPlan(fileUrl, probe?.vcodec ?? null);
+      const langs = probe?.audioLangs ?? [];
+      const duration = probe?.durationSec ?? null;
+
+      // One full cast cycle at a start position. Returns when the helper
+      // exits; `seekedTo` is set when a UI seek arrived mid-cycle.
+      const runCycle = async (
+        startSec: number,
+      ): Promise<{ code: number | null; errTail: string; seekedTo: number | null }> => {
+        const finalUrl =
+          plan.mode === "transcode"
+            ? await airplayTranscode(fileUrl, plan.video, langs, onStatus, startSec, duration)
+            : fileUrl;
+        const helper = spawn(
+          pyBin,
+          [helperScript, "play", id, finalUrl, "--report-pos"],
+          { stdio: ["ignore", "pipe", "pipe"], detached: true, env },
+        );
+        helper.unref();
+        activeAirplayCast = { pyBin, helperScript, id, env, helper };
+        let seekedTo: number | null = null;
+        let errTail = "";
+        helper.stderr?.on("data", (chunk: Buffer) => {
+          errTail = (errTail + chunk.toString()).split("\n").slice(-8).join("\n");
+        });
+        let buffer = "";
+        helper.stdout?.on("data", (chunk: Buffer) => {
+          buffer += chunk.toString();
+          let idx: number;
+          while ((idx = buffer.indexOf("\n")) >= 0) {
+            const line = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 1);
+            if (!line.startsWith("POS:")) continue;
+            const pos = Number(line.slice(4));
+            if (Number.isFinite(pos)) lastPosition = startSec + pos;
+          }
+        });
+        const code = await new Promise<number | null>((resolve) => {
+          const startupMs = 45_000;
+          const timer = setTimeout(() => {
+            helper.removeListener("exit", onExit);
+            resolve(null); // still running → treat as playing
+          }, startupMs);
+          const onExit = (c: number | null): void => {
+            clearTimeout(timer);
+            resolve(c);
+          };
+          helper.once("exit", onExit);
+        });
+        // A UI-requested seek (,/. keys): the helper is killed by castSeek();
+        // consume the target here so the outer loop restarts at the new spot.
+        if (pendingSeek !== null) {
+          seekedTo = pendingSeek;
+          pendingSeek = null;
+        }
+        if (activeAirplayCast?.helper === helper) activeAirplayCast = null;
+        return { code, errTail, seekedTo };
+      };
+
+      let position = 0;
+      for (;;) {
+        const { code, errTail, seekedTo } = await runCycle(position);
+        if (seekedTo !== null) {
+          position = seekedTo;
+          continue; // restart transcode + recast at the new spot
+        }
+        if (code !== null && code !== 0) {
+          const errLine = errTail.split("\n").reverse().find((l) => l.startsWith("TORLNK_ERR: "));
+          onStatus?.({ state: "failed", detail: errLine?.replace(/^TORLNK_ERR: /, "") ?? "AirPlay helper failed" });
+          return;
+        }
+        onStatus?.({ state: "playing" });
+        return;
+      }
+    } catch (e) {
+      onStatus?.({ state: "failed", detail: e instanceof Error ? e.message : String(e) });
+    }
+  })();
+}
+
+// Pending UI seek target for the active AirPlay cast, in seconds. Set by
+// castSeek(); consumed by the runCycle loop on the next iteration.
+let pendingSeek: number | null = null;
+
+// Last receiver-reported position (absolute, seconds), for relative seeks.
+let lastPosition = 0;
+
+// Seek the active AirPlay cast. A negative/positive delta seeks relative to
+// the last reported position; an absolute target can be passed via options.
+// No-op when nothing is casting via AirPlay. The ATV's own remote scrub seeks
+// natively now (full VOD playlist); this path is for torlnk's keyboard seek.
+export function castSeek(deltaSec: number, opts?: { absolute?: boolean }): void {
+  if (!activeAirplayCast) return;
+  pendingSeek = opts?.absolute ? Math.max(0, deltaSec) : Math.max(0, lastPosition + deltaSec);
+  activeAirplayCast.helper?.kill("SIGTERM");
 }
 
 export function startCastDiscovery(
@@ -361,28 +480,7 @@ export function startCastDiscovery(
             name: `AirPlay: ${name}`,
             id,
             play: (url: string) => {
-              void (async () => {
-                try {
-                  onStatus?.({ state: "preparing" });
-                  const ip = lanIp();
-                  const castUrl = ip ? url.replace("127.0.0.1", ip) : url;
-                  const fileUrl = await resolveFileUrl(castUrl, ip ?? "127.0.0.1");
-                  const probe = await probeStreams(fileUrl);
-                  const plan = airplayPlan(fileUrl, probe?.vcodec ?? null);
-                  const finalUrl =
-                    plan.mode === "transcode"
-                      ? await airplayTranscode(fileUrl, plan.video, probe?.audioLangs ?? [], onStatus)
-                      : fileUrl;
-                  const proc = spawn(pyBin!, [helperScript, "play", id, finalUrl], {
-                    stdio: "ignore", detached: true, env,
-                  });
-                  proc.on("error", () => {});
-                  proc.unref();
-                  onStatus?.({ state: "playing" });
-                } catch (e) {
-                  onStatus?.({ state: "failed", detail: e instanceof Error ? e.message : String(e) });
-                }
-              })();
+              castViaHelper(pyBin!, helperScript, id, url, env, onStatus);
             },
           });
         }

@@ -754,7 +754,10 @@ export function App({
             <Footer
               hints={
                 cast
-                  ? [...footerHints(region, section, downloadFocus, seedFocus, resultFocus), { keys: "S", label: "Stop cast" }]
+                  ? [
+                      ...footerHints(region, section, downloadFocus, seedFocus, resultFocus),
+                      { keys: "S", label: "Stop cast" },
+                    ]
                   : footerHints(region, section, downloadFocus, seedFocus, resultFocus)
               }
               right={cast && cols >= 90 ? <CastStatusView deviceName={cast.deviceName} title={cast.title} status={cast.status} /> : null}

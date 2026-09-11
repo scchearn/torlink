@@ -23,7 +23,7 @@ export function CastStatus({ deviceName, title, status }: CastStatusProps) {
   const state = status?.state ?? "playing";
   const busy = state === "preparing" || state === "transcoding";
   return (
-    <Box flexShrink={0} marginLeft={2}>
+    <Box flexShrink={0} marginLeft={2} gap={1} alignItems="center">
       {busy ? <Spinner /> : (
         <Text color={state === "failed" ? COLOR.bad : COLOR.good}>
           {state === "failed" ? ICON.error : ICON.done}
