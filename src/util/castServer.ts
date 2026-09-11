@@ -54,7 +54,7 @@ function variantPlaylist(count: number, ext: "ts" | "m4s"): string {
     "#EXT-X-PLAYLIST-TYPE:VOD",
   ];
   for (let i = 0; i < count; i++) {
-    lines.push("#EXTINF:2.000000,", `seg${i}.${ext}`);
+    lines.push("#EXTINF:2.000000,", `seg${String(i).padStart(3, "0")}.${ext}`);
   }
   lines.push("#EXT-X-ENDLIST");
   return lines.join("\n") + "\n";
@@ -62,17 +62,19 @@ function variantPlaylist(count: number, ext: "ts" | "m4s"): string {
 
 export function buildMasterPlaylist(plan: SegmentPlan): string {
   const lines = ["#EXTM3U", "#EXT-X-VERSION:3"];
+  // Variant dirs mirror the runner's var_stream_map order: video = "0",
+  // audio track i = "i+1".
   plan.audioLangs.forEach((lang, i) => {
     const tag = lang ? `,LANGUAGE="${lang.toUpperCase().slice(0, 3)}"` : "";
     lines.push(
-      `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="audio_${i}"${tag},DEFAULT=${i === 0 ? "YES" : "NO"},CHANNELS="2",URI="${i}/playlist.m3u8"`,
+      `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="audio_${i}"${tag},DEFAULT=${i === 0 ? "YES" : "NO"},CHANNELS="2",URI="${i + 1}/pl.m3u8"`,
     );
   });
   // HEVC copy requires hvc1 in CODECS; h264 re-encode matches the runner's
   // output (High@4.0). Audio is always AAC-LC stereo.
   const vcodec = plan.video === "copy" && plan.sourceHevc ? "hvc1.1.6.L120.90" : "avc1.640028";
   lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS="${vcodec},mp4a.40.2",AUDIO="aud"`);
-  lines.push("v/playlist.m3u8");
+  lines.push("0/pl.m3u8");
   return lines.join("\n") + "\n";
 }
 
@@ -87,10 +89,17 @@ function freePort(): Promise<number> {
   });
 }
 
-// One continuous ffmpeg encode: segments [fromSeg, toSeg), cut at exact 2s
-// input boundaries. Exits on its own at the window end. The video variant is
-// the runner's output; audio variants are produced by separate light runners
-// (audio-only encode is ~10x cheaper and its own window keeps the queue simple).
+// One continuous ffmpeg encode per window, video AND all audio tracks in the
+// SAME process — this is what keeps A/V sample-locked. Separate per-stream
+// runners each do their own -ss anchor and drift apart by up to a frame at
+// every segment boundary (measured 72ms audio-lead on a DDP5.1 source); a
+// combined encode anchors once and shares one demuxer clock (measured ≤16ms,
+// inaudible). Segments [fromSeg, toSeg), cut at exact 2s boundaries; exits on
+// its own at the window end.
+//
+// Variant layout: ffmpeg numbers variants in var_stream_map order — video
+// first (dir "0"), then audio track i (dir "i+1"). The master playlist and
+// the server's request routing use the same mapping.
 function spawnRunner(plan: SegmentPlan, dir: string, fromSeg: number, toSeg: number): ChildProcess {
   const start = plan.startSec + fromSeg * SEGMENT_SEC;
   const duration = (toSeg - fromSeg) * SEGMENT_SEC;
@@ -105,63 +114,50 @@ function spawnRunner(plan: SegmentPlan, dir: string, fromSeg: number, toSeg: num
     "-i", plan.sourceUrl,
     "-t", duration.toFixed(3),
     "-map", "0:v:0",
+    ...plan.audioLangs.map((_, i) => ["-map", `0:a:${i}`]).flat(),
   ];
   if (copy) {
     // Stream copy: no filters (filters require re-encode). Keyframe-aligned
     // cutting relies on the source's own GOP; segment boundaries may drift
-    // slightly from the 2s grid, which the playlist's real EXTINF values
-    // would need to reflect — copy mode is only granted for well-formed
+    // slightly from the 2s grid — copy mode is only granted for well-formed
     // sources, so this is acceptable.
     args.push("-c:v", "copy");
   } else {
-    args.push("-vf", filters.join(",").replace(/^,/, ""));
+    args.push("-vf", `${filters.join(",")},setpts=PTS-STARTPTS`);
     args.push("-force_key_frames", `expr:gte(t,n_forced*${SEGMENT_SEC})`);
     args.push("-c:v", "libx264", "-preset", "veryfast");
   }
+  args.push("-af", "aresample=async=1:first_pts=0");
+  args.push("-c:a", "aac", "-b:a", "192k", "-ac", "2");
+  const ext = plan.segmentType === "fmp4" ? "m4s" : "ts";
   args.push(
     "-f", "hls",
     "-hls_time", String(SEGMENT_SEC),
     "-hls_list_size", "0",
     "-hls_segment_type", plan.segmentType,
     "-hls_playlist_type", "vod",
-    "-hls_segment_filename", path.join(dir, "v", `seg%d.${plan.segmentType === "fmp4" ? "m4s" : "ts"}`),
-    "-start_number", String(fromSeg),
     "-master_pl_name", "runner.m3u8",
-    path.join(dir, "runner-v.m3u8"),
+    "-var_stream_map",
+    [
+      // Video first: variant 0 = video (served from dir "0"), audio track i
+      // = variant i+1 (dir "i+1"). ffmpeg numbers variants in map order.
+      "v:0,agroup:aud0",
+      ...plan.audioLangs.map((_, i) => `a:${i},agroup:aud0`),
+    ].join(" "),
+    "-hls_segment_filename", path.join(dir, "%v", `seg%03d.${ext}`),
+    "-start_number", String(fromSeg),
+    // The runner's own per-variant playlist goes to a throwaway name — the
+    // server serves the authoritative full-length playlist instead.
+    path.join(dir, "%v", "runner-pl.m3u8"),
   );
-  return spawn("ffmpeg", args, { stdio: "ignore" });
-}
-
-// Audio-only runner for one track: same grid, ~10x cheaper than video.
-function spawnAudioRunner(plan: SegmentPlan, dir: string, track: number, fromSeg: number, toSeg: number): ChildProcess {
-  const start = plan.startSec + fromSeg * SEGMENT_SEC;
-  const duration = (toSeg - fromSeg) * SEGMENT_SEC;
-  const args = [
-    "-y",
-    "-ss", start.toFixed(3),
-    "-i", plan.sourceUrl,
-    "-t", duration.toFixed(3),
-    "-map", `0:a:${track}`,
-    "-vn",
-    "-af", "aresample=async=1:first_pts=0",
-    "-c:a", "aac", "-b:a", "192k", "-ac", "2",
-    "-f", "hls",
-    "-hls_time", String(SEGMENT_SEC),
-    "-hls_list_size", "0",
-    "-hls_segment_type", "mpegts",
-    "-hls_playlist_type", "vod",
-    "-hls_segment_filename", path.join(dir, String(track), "seg%d.ts"),
-    "-start_number", String(fromSeg),
-    "-master_pl_name", "runner.m3u8",
-    path.join(dir, `runner-${track}.m3u8`),
-  ];
   return spawn("ffmpeg", args, { stdio: "ignore" });
 }
 
 function reportProgress(dir: string, plan: SegmentPlan, onProgress?: (pct: number) => void): void {
   if (!onProgress) return;
   try {
-    const count = readdirSync(path.join(dir, "v")).filter((f) => f.endsWith(".ts")).length;
+    // Video variant is dir "0" (see variant layout).
+    const count = readdirSync(path.join(dir, "0")).filter((f) => f.endsWith(".ts") || f.endsWith(".m4s")).length;
     onProgress(Math.min(99, Math.round((count / segmentCount(plan)) * 100)));
   } catch {}
 }
@@ -186,53 +182,53 @@ export async function startOnDemandServer(
   onProgress?: (pct: number) => void,
 ): Promise<{ url: string; dir: string; stop: () => void }> {
   const dir = path.join(tmpdir(), `torlnk-cast-${Date.now()}`);
-  mkdirSync(path.join(dir, "v"), { recursive: true });
-  plan.audioLangs.forEach((_, i) => mkdirSync(path.join(dir, String(i)), { recursive: true }));
+  // Variant dirs mirror the runner's var_stream_map order: video = "0",
+  // audio track i = "i+1".
+  mkdirSync(path.join(dir, "0"), { recursive: true });
+  plan.audioLangs.forEach((_, i) => mkdirSync(path.join(dir, String(i + 1)), { recursive: true }));
 
   const ext = plan.segmentType === "fmp4" ? "m4s" : "ts";
+  // master.m3u8 and the full-length per-variant playlists are pre-written;
+  // the runner only produces segment files (its own playlist output goes to
+  // runner-pl.m3u8, unused).
   writeFileSync(path.join(dir, "master.m3u8"), buildMasterPlaylist(plan));
-  writeFileSync(path.join(dir, "v", "playlist.m3u8"), variantPlaylist(segmentCount(plan), ext));
+  writeFileSync(path.join(dir, "0", "pl.m3u8"), variantPlaylist(segmentCount(plan), ext));
   plan.audioLangs.forEach((_, i) =>
-    writeFileSync(path.join(dir, String(i), "playlist.m3u8"), variantPlaylist(segmentCount(plan), "ts")),
+    writeFileSync(path.join(dir, String(i + 1), "pl.m3u8"), variantPlaylist(segmentCount(plan), "ts")),
   );
 
   const total = segmentCount(plan);
-  const videoRunner: RunnerState = { proc: null, fromSeg: -1, toSeg: -1 };
-  const audioRunners: RunnerState[] = plan.audioLangs.map(() => ({ proc: null, fromSeg: -1, toSeg: -1 }));
+  const runner: RunnerState = { proc: null, fromSeg: -1, toSeg: -1 };
 
-  // Ensure segment `segIndex` is inside the window a runner is producing.
-  // Starts/re-anchors a runner when none is active or the request falls
-  // outside the current window.
-  function ensureWindow(state: RunnerState, segIndex: number, spawnFn: (from: number, to: number) => ChildProcess): void {
+  // Ensure segment `segIndex` is inside the window the runner is producing.
+  // Re-anchors when none is active or the request falls outside the window.
+  function ensureWindow(segIndex: number): void {
     if (segIndex >= total) return;
-    const inWindow = state.proc !== null && segIndex >= state.fromSeg && segIndex < state.toSeg;
+    const inWindow = runner.proc !== null && segIndex >= runner.fromSeg && segIndex < runner.toSeg;
     if (inWindow) return;
-    if (state.proc) {
-      state.proc.kill("SIGKILL");
-      state.proc = null;
+    if (runner.proc) {
+      runner.proc.kill("SIGKILL");
+      runner.proc = null;
     }
     const fromSeg = Math.max(0, segIndex);
     const toSeg = Math.min(total, fromSeg + RUN_SEGMENT_COUNT);
-    state.proc = spawnFn(fromSeg, toSeg);
-    state.fromSeg = fromSeg;
-    state.toSeg = toSeg;
-    state.proc.on("exit", () => {
+    runner.proc = spawnRunner(plan, dir, fromSeg, toSeg);
+    runner.fromSeg = fromSeg;
+    runner.toSeg = toSeg;
+    runner.proc.on("exit", () => {
       // Natural window completion: clear so the next request re-anchors.
-      if (state.proc && state.proc.exitCode !== null && state.proc.exitCode !== undefined) state.proc = null;
+      if (runner.proc && runner.proc.exitCode !== null && runner.proc.exitCode !== undefined) runner.proc = null;
     });
   }
 
   // Kick off encoding from the plan's start position immediately.
-  ensureWindow(videoRunner, 0, (a, b) => spawnRunner(plan, dir, a, b));
-  audioRunners.forEach((state, track) => {
-    ensureWindow(state, 0, (a, b) => spawnAudioRunner(plan, dir, track, a, b));
-  });
+  ensureWindow(0);
 
   const port = await freePort();
   const server = http.createServer((req, res) => {
     const name = decodeURIComponent((req.url ?? "").split("?")[0] ?? "").replace(/^\/+/, "");
     // Pre-written playlists.
-    if (name === "master.m3u8" || name.endsWith("/playlist.m3u8")) {
+    if (name === "master.m3u8" || name.endsWith("/pl.m3u8")) {
       const file = path.join(dir, name);
       if (!existsSync(file)) {
         res.writeHead(404).end();
@@ -255,7 +251,8 @@ export async function startOnDemandServer(
       res.writeHead(404).end();
       return;
     }
-    const file = path.join(dir, variant, `seg${segIndex}.ts`);
+    const ext = plan.segmentType === "fmp4" ? "m4s" : "ts";
+    const file = path.join(dir, variant, `seg${String(segIndex).padStart(3, "0")}.${ext}`);
     const respond = (): void => {
       if (existsSync(file)) {
         serveFile(res, file, "video/mp2t");
@@ -268,14 +265,8 @@ export async function startOnDemandServer(
       respond();
       return;
     }
-    // Seek into unwritten territory: re-anchor the runner(s) here.
-    if (variant === "v") {
-      ensureWindow(videoRunner, segIndex, (a, b) => spawnRunner(plan, dir, a, b));
-    } else {
-      const track = Number(variant);
-      const state = audioRunners[track];
-      if (state) ensureWindow(state, segIndex, (a, b) => spawnAudioRunner(plan, dir, track, a, b));
-    }
+    // Seek into unwritten territory: re-anchor the runner here.
+    ensureWindow(segIndex);
     // Poll for the segment (runners produce it within a couple of seconds).
     let waited = 0;
     const poll = setInterval(() => {
@@ -296,8 +287,7 @@ export async function startOnDemandServer(
     url: `http://${lanIp}:${port}/master.m3u8`,
     dir,
     stop: () => {
-      videoRunner.proc?.kill("SIGKILL");
-      audioRunners.forEach((s) => s.proc?.kill("SIGKILL"));
+      runner.proc?.kill("SIGKILL");
       server.close();
     },
   };
