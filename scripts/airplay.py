@@ -61,7 +61,8 @@ async def scan(loop):
     for d in devs:
         os_name = getattr(d.device_info.operating_system, "name", "")
         if os_name == "TvOS":
-            print(f"{d.identifier}\t{d.name}")
+            model = str(getattr(d.device_info, "model", "") or "")
+            print(f"{d.identifier}\t{d.name}\t{model}")
 
 
 async def play_once(loop, device_id, url, position=0.0, report_pos=False):

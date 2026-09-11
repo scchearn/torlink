@@ -118,6 +118,7 @@ export interface CastDevice {
   kind: "chromecast" | "airplay";
   name: string;
   id: string;
+  model?: string; // pyatv DeviceModel string (airplay only)
   play: (url: string) => void;
 }
 
@@ -133,17 +134,81 @@ export type CastStatusSink = (status: CastStatus) => void;
 
 // --- AirPlay transcode fallback: tvOS only plays mp4/mov containers or HLS ---
 
-export type AirplayPlan = { mode: "direct" } | { mode: "transcode"; video: "copy" | "encode" };
+// What a cast target can decode natively. We can't query decoder caps over
+// AirPlay/Cast, so this is a known-model table with a conservative default;
+// the TORLINK_CAST_PROFILE env var overrides for people who know their
+// hardware.
+//
+// Sources: Apple tech specs (support.apple.com/111928, /111929, /111922) and
+// Google's Cast media docs (developers.google.com/cast/docs/media).
+//
+// Nuances the table encodes:
+// - ATV HD (A8) natively decodes HEVC Main/Main10 per Apple's spec, but
+//   empirically rejects fmp4 HLS over AirPlay cast — and HEVC is only
+//   carryable in fmp4 segments — so HEVC stays unavailable on the cast path.
+// - ATV 4K models' fmp4-over-AirPlay behavior is UNVERIFIED (only Gen4 has
+//   been tested); they are marked capable, and TORLINK_CAST_PROFILE=low is
+//   the fallback if a given unit misbehaves.
+// - HEVC in mpegts is unsupported on Cast receivers too, so canHevc always
+//   implies segmentType fmp4.
+export interface CastCapabilities {
+  canHevc: boolean; // implies fmp4 segments (HEVC is not carryable in mpegts)
+  can10bit: boolean;
+  segmentType: "mpegts" | "fmp4";
+}
+
+const ATV_HD_A8: CastCapabilities = { canHevc: false, can10bit: false, segmentType: "mpegts" };
+const ATV_MODERN: CastCapabilities = { canHevc: true, can10bit: true, segmentType: "fmp4" };
+const CHROMECAST_H264: CastCapabilities = { canHevc: false, can10bit: false, segmentType: "mpegts" };
+const CHROMECAST_HEVC: CastCapabilities = { canHevc: true, can10bit: true, segmentType: "fmp4" };
+
+// Known Apple TV models by pyatv DeviceModel string.
+const MODEL_CAPS: Record<string, CastCapabilities> = {
+  "DeviceModel.Gen4": ATV_HD_A8, // Apple TV HD (A8)
+  "DeviceModel.Gen4K": ATV_MODERN, // Apple TV 4K gen 1 (A10X)
+  "DeviceModel.Gen5": ATV_MODERN, // Apple TV 4K gen 2 (A12)
+  "DeviceModel.Gen6": ATV_MODERN, // Apple TV 4K gen 3 (A15)
+};
+
+// Chromecasts cannot be model-distinguished via the chromecasts npm package
+// (it exposes only a name), so the default is the most common hardware:
+// gen2/gen3, H.264-only per Google's docs. Ultra/Google TV owners set
+// TORLINK_CAST_PROFILE=high.
+export function capsForDevice(kind: string, deviceId: string): CastCapabilities {
+  const override = process.env.TORLINK_CAST_PROFILE;
+  if (override === "high") return kind === "chromecast" ? CHROMECAST_HEVC : ATV_MODERN;
+  if (override === "low") return kind === "chromecast" ? CHROMECAST_H264 : ATV_HD_A8;
+  if (kind === "chromecast") return CHROMECAST_H264;
+  return MODEL_CAPS[deviceId] ?? CHROMECAST_H264;
+}
+
+export type AirplayPlan =
+  | { mode: "direct" }
+  | { mode: "transcode"; video: "copy" | "encode"; pixFmt: "copy" | "yuv420p" };
 
 // `url` may be an http URL or a local file path (multi-file torrents resolve to an .m3u path).
-// ponytail: mpegts HLS can't carry HEVC (needs fmp4, which this ATV rejects over
-// AirPlay), so hevc is re-encoded to h264 like any other foreign codec. Revisit
-// if a per-device segment-type negotiation ever matters.
-export function airplayPlan(url: string, vcodec: string | null): AirplayPlan {
+// The plan is capability-aware: copy what the target decodes natively, encode
+// the rest, and force 8-bit output only when the target needs it.
+export function airplayPlan(
+  url: string,
+  vcodec: string | null,
+  pixFmt: string | null,
+  caps: CastCapabilities,
+): AirplayPlan {
   if (/\.(mp4|m4v|mov)$/i.test(url)) return { mode: "direct" };
-  if (vcodec === "h264") return { mode: "transcode", video: "copy" };
   if (vcodec === null) return { mode: "direct" }; // ponytail: probe failed, try direct and hope
-  return { mode: "transcode", video: "encode" }; // hevc/vp9/av1/mpeg2 etc.
+  const tenBit = pixFmt?.includes("10le") ?? false;
+  if (vcodec === "h264" && !(tenBit && !caps.can10bit)) {
+    return { mode: "transcode", video: "copy", pixFmt: "copy" };
+  }
+  if (vcodec === "hevc" && caps.canHevc) {
+    // HEVC requires fmp4 segments; the capability table only grants canHevc
+    // when the target also accepts fmp4.
+    return { mode: "transcode", video: "copy", pixFmt: "copy" };
+  }
+  // Foreign codec (or 10-bit on an 8-bit target): re-encode, downconverting
+  // depth when the target can't do 10-bit.
+  return { mode: "transcode", video: "encode", pixFmt: tenBit && !caps.can10bit ? "yuv420p" : "copy" };
 }
 
 function probeVideoCodec(url: string): Promise<string | null> {
@@ -152,6 +217,7 @@ function probeVideoCodec(url: string): Promise<string | null> {
 
 interface ProbedStream {
   vcodec: string | null;
+  pixFmt: string | null;
   durationSec: number | null;
   audioLangs: string[]; // per audio stream, language tag or ""
 }
@@ -160,7 +226,7 @@ function probeStreams(url: string): Promise<ProbedStream | null> {
   return new Promise((resolve) => {
     execFile(
       "ffprobe",
-      ["-v", "error", "-show_entries", "stream=codec_name,codec_type:stream_tags=language:format=duration", "-of", "json", url],
+      ["-v", "error", "-show_entries", "stream=codec_name,codec_type,pix_fmt:stream_tags=language:format=duration", "-of", "json", url],
       { timeout: 15000 },
       (err, stdout) => {
         if (err) return resolve(null);
@@ -168,8 +234,10 @@ function probeStreams(url: string): Promise<ProbedStream | null> {
           const parsed = JSON.parse(stdout);
           const streams = parsed.streams ?? [];
           const duration = Number(parsed.format?.duration);
+          const video = streams.find((s: { codec_type?: string }) => s.codec_type === "video");
           resolve({
-            vcodec: streams.find((s: { codec_type?: string }) => s.codec_type === "video")?.codec_name ?? null,
+            vcodec: video?.codec_name ?? null,
+            pixFmt: video?.pix_fmt ?? null,
             durationSec: Number.isFinite(duration) ? duration : null,
             audioLangs: streams
               .filter((s: { codec_type?: string }) => s.codec_type === "audio")
@@ -232,6 +300,9 @@ export function buildVarStreamMap(audioLangs: string[]): { map: string; defaultI
 async function airplayTranscode(
   url: string,
   video: "copy" | "encode",
+  pixFmt: "copy" | "yuv420p",
+  segmentType: "mpegts" | "fmp4",
+  sourceHevc: boolean,
   audioLangs: string[],
   onStatus?: CastStatusSink,
   startSec = 0,
@@ -241,7 +312,9 @@ async function airplayTranscode(
   stopActiveTranscode();
   cleanStaleTranscodeDirs();
   if (!durationSec) throw new Error("cannot determine media duration");
-  const plan: SegmentPlan = { sourceUrl: url, durationSec, audioLangs, video, startSec };
+  const plan: SegmentPlan = {
+    sourceUrl: url, durationSec, audioLangs, video, pixFmt, segmentType, sourceHevc, startSec,
+  };
   const ip = lanIp() ?? "127.0.0.1";
   const server = await startOnDemandServer(plan, ip, (pct) => {
     onStatus?.({ state: "transcoding", detail: `${pct}%` });
@@ -323,6 +396,7 @@ function castViaHelper(
   pyBin: string,
   helperScript: string,
   id: string,
+  model: string,
   url: string,
   env: NodeJS.ProcessEnv,
   onStatus?: CastStatusSink,
@@ -334,7 +408,8 @@ function castViaHelper(
       const castUrl = ip ? url.replace("127.0.0.1", ip) : url;
       const fileUrl = await resolveFileUrl(castUrl, ip ?? "127.0.0.1");
       const probe = await probeStreams(fileUrl);
-      const plan = airplayPlan(fileUrl, probe?.vcodec ?? null);
+      const caps = capsForDevice("airplay", model);
+      const plan = airplayPlan(fileUrl, probe?.vcodec ?? null, probe?.pixFmt ?? null, caps);
       const langs = probe?.audioLangs ?? [];
       const duration = probe?.durationSec ?? null;
 
@@ -345,7 +420,10 @@ function castViaHelper(
       ): Promise<{ code: number | null; errTail: string; seekedTo: number | null }> => {
         const finalUrl =
           plan.mode === "transcode"
-            ? await airplayTranscode(fileUrl, plan.video, langs, onStatus, startSec, duration)
+            ? await airplayTranscode(
+                fileUrl, plan.video, plan.pixFmt, caps.segmentType,
+                probe?.vcodec === "hevc", langs, onStatus, startSec, duration,
+              )
             : fileUrl;
         const helper = spawn(
           pyBin,
@@ -473,14 +551,15 @@ export function startCastDiscovery(
     execFile(pyBin, [helperScript, "scan"], { env, timeout: 10000 }, (err, stdout) => {
       if (err) return;
       for (const line of stdout.trim().split("\n")) {
-        const [id, name] = line.split("\t");
+        const [id, name, model] = line.split("\t");
         if (id && name) {
           onDevice({
             kind: "airplay",
             name: `AirPlay: ${name}`,
             id,
+            model,
             play: (url: string) => {
-              castViaHelper(pyBin!, helperScript, id, url, env, onStatus);
+              castViaHelper(pyBin!, helperScript, id, model ?? "", url, env, onStatus);
             },
           });
         }
