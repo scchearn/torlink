@@ -16,6 +16,7 @@ import {
 import { logCrash } from "../util/crashlog";
 import { parseInput } from "../sources/magnet";
 import { magnetFromTorrentFile } from "../sources/torrentFile";
+import { setTmdbKey } from "../sources/skwirll";
 import { resolveTorrentPath } from "../sources/torrentPath";
 import { readClipboard, writeClipboard } from "../util/clipboard";
 import { openFolder } from "../util/openFolder";
@@ -46,7 +47,7 @@ import { FolderPrompt } from "./components/FolderPrompt";
 import { TrackersPrompt } from "./components/TrackersPrompt";
 import { PlayerPicker } from "./components/PlayerPicker";
 import { CastStatus as CastStatusView } from "./components/CastBar";
-import { stopActiveCast, type CastStatus } from "../util/players";
+import { castPauseResume, stopActiveCast, type CastStatus } from "../util/players";
 import { footerHints } from "./keymap";
 import { COLOR, ICON } from "./theme";
 import { useMouseWheel } from "./hooks/useMouseWheel";
@@ -114,6 +115,7 @@ export function App({
   const [lastDownloadToDir, setLastDownloadToDir] = useState<string | null>(null);
   const [playerPickerTarget, setPlayerPickerTarget] = useState<{ id: string; name: string } | null>(null);
   const [cast, setCast] = useState<{ deviceName: string; title: string; status: CastStatus | null } | null>(null);
+  const [castPaused, setCastPaused] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [updateVersion, setUpdateVersion] = useState<string | null>(null);
   const [recovered, setRecovered] = useState(false);
@@ -127,6 +129,7 @@ export function App({
       const cfg = await loadConfig();
       const q = new DownloadQueue();
       q.setTrackers(cfg.trackers);
+      setTmdbKey(cfg.tmdbKey);
       // Crash-boot breaker: a marker left behind by the previous boot means it
       // died mid-restore, so this one restores everything paused with the
       // engine cold (safe mode) instead of walking into the same explosion.
@@ -606,6 +609,12 @@ export function App({
         setCast(null);
         return;
       }
+      if (input === "p" && cast?.status?.state === "playing") {
+        const next = castPaused ? "resume" : "pause";
+        castPauseResume(next);
+        setCastPaused(!castPaused);
+        return;
+      }
       if (key.tab) {
         setRegion(region === "sidebar" ? "content" : "sidebar");
         return;
@@ -723,6 +732,7 @@ export function App({
             target={playerPickerTarget}
             onLaunch={(launch, deviceName) => {
               setCast({ deviceName, title: cleanText(playerPickerTarget.name), status: null });
+              setCastPaused(false);
               launch();
               setPlayerPickerTarget(null);
             }}
@@ -756,6 +766,7 @@ export function App({
                 cast
                   ? [
                       ...footerHints(region, section, downloadFocus, seedFocus, resultFocus),
+                      { keys: "p", label: castPaused ? "Play" : "Pause" },
                       { keys: "S", label: "Stop cast" },
                     ]
                   : footerHints(region, section, downloadFocus, seedFocus, resultFocus)

@@ -8,7 +8,7 @@ interface NavItem {
   label: string;
 }
 
-const FILTERS: NavItem[] = CATEGORIES.map((c) => ({
+const FILTERS: NavItem[] = CATEGORIES.filter((c) => c.key !== "new").map((c) => ({
   key: c.key as Section,
   label: c.label,
 }));
@@ -17,9 +17,13 @@ const LIBRARY: NavItem[] = [
   { key: "seeding", label: "Seeding" },
 ];
 
+// New Releases gets its own visual group between the category filters and the
+// library, so the sidebar reads: filters · gap · New Releases · gap · library.
+const NEW_RELEASES: NavItem[] = [{ key: "new", label: "New Releases" }];
+
 const BADGED = (key: Section): boolean => key === "downloads" || key === "seeding";
 
-const GROUPS: NavItem[][] = [FILTERS, LIBRARY];
+const GROUPS: NavItem[][] = [FILTERS, NEW_RELEASES, LIBRARY];
 
 const NAV: NavItem[] = GROUPS.flat();
 

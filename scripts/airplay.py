@@ -139,7 +139,8 @@ async def _report_positions(atv):
 
     The compat shim stashes the AirPlayV2Compat instance on the stream; its
     metadata() returns the last nowPlayingInfo (elapsedTime/duration) pushed
-    on the encrypted event channel. Print POS lines for Node's seek watcher.
+    on the encrypted event channel. Print POS:<elapsed>[:<duration>] lines
+    for Node's progress display and seek watcher.
     """
     import sys
     last = -1.0
@@ -155,7 +156,11 @@ async def _report_positions(atv):
                 continue
             if abs(elapsed - last) >= 1.0:
                 last = elapsed
-                print(f"POS:{elapsed:.1f}", flush=True)
+                duration = info.get("duration")
+                if duration:
+                    print(f"POS:{elapsed:.1f}:{float(duration):.1f}", flush=True)
+                else:
+                    print(f"POS:{elapsed:.1f}", flush=True)
         except Exception:
             # Session may be gone; keep polling until the outer task is cancelled.
             continue
@@ -209,10 +214,48 @@ async def stop(loop, device_id):
             restore()
 
 
+async def pause_resume(loop, device_id, action):
+    """Pause or resume playback on the device (action: "pause" | "resume").
+
+    Connects, sends the remote command, exits. The play session itself lives
+    in the long-running `play` process; this is a control-plane side call.
+    """
+    import pyatv
+    config = await _find(loop, device_id)
+
+    restore = None
+    atv = None
+    try:
+        try:
+            from pyatv_compat import install
+            restore = install(pyatv)
+        except ImportError:
+            pass
+        atv = await _connect(loop, config)
+        if action == "pause":
+            await atv.remote_control.pause()
+        else:
+            await atv.remote_control.play()
+        atv.close()
+        atv = None
+    except Exception as e:
+        # Control-plane calls are best-effort: the session may have ended
+        # between the UI action and this call. Report, exit 0.
+        print(f"{action}: {e}", file=sys.stderr)
+    finally:
+        if atv is not None:
+            try:
+                atv.close()
+            except Exception:
+                pass
+        if restore:
+            restore()
+
+
 def main():
     args = sys.argv[1:]
     if not args:
-        fail("Usage: airplay.py scan | play <id> <url> [--position S] [--report-pos] | stop <id>")
+        fail("Usage: airplay.py scan | play <id> <url> [--position S] [--report-pos] | stop <id> | pause <id> | resume <id>")
 
     loop = asyncio.new_event_loop()
     try:
@@ -239,8 +282,10 @@ def main():
             loop.run_until_complete(play(loop, device_id, url, position=position, report_pos=report_pos))
         elif args[0] == "stop" and len(args) == 2:
             loop.run_until_complete(stop(loop, args[1]))
+        elif args[0] in ("pause", "resume") and len(args) == 2:
+            loop.run_until_complete(pause_resume(loop, args[1], args[0]))
         else:
-            fail("Usage: airplay.py scan | play <id> <url> [--position S] [--report-pos] | stop <id>")
+            fail("Usage: airplay.py scan | play <id> <url> [--position S] [--report-pos] | stop <id> | pause <id> | resume <id>")
     finally:
         loop.close()
 

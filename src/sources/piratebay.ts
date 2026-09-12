@@ -83,6 +83,13 @@ async function search(
     const r = toResult(it, source);
     if (r) out.push(r);
   }
+  if (!q) {
+    // The precompiled top-100 lists are seeders-ranked, which skews the
+    // browse view toward old blockbusters. Newest-first reads better next to
+    // YTS's date_added browse; the top-100 pool is the ceiling of what
+    // apibay exposes (no day/week variants, no ordering params on search).
+    out.sort((a, b) => (b.added ?? 0) - (a.added ?? 0));
+  }
   return out;
 }
 

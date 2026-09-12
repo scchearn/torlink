@@ -16,12 +16,23 @@ const STATE_LABEL: Record<CastStatus["state"], string> = {
   failed: "cast failed",
 };
 
+function clock(totalSec: number): string {
+  const s = Math.max(0, Math.floor(totalSec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const mm = String(m).padStart(2, "0");
+  const ss = String(sec).padStart(2, "0");
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
 // Right segment of the footer while a cast is live: spinner while working,
-// state + device once settled. Hidden below ~90 cols so it never crowds the
-// key hints (the `S Stop cast` hint stays).
+// state + device + now-playing position once settled. Hidden below ~90 cols
+// so it never crowds the key hints (the `S Stop cast` hint stays).
 export function CastStatus({ deviceName, title, status }: CastStatusProps) {
   const state = status?.state ?? "playing";
   const busy = state === "preparing" || state === "transcoding";
+  const playing = state === "playing";
   return (
     <Box flexShrink={0} marginLeft={2} gap={1} alignItems="center">
       {busy ? <Spinner /> : (
@@ -38,6 +49,15 @@ export function CastStatus({ deviceName, title, status }: CastStatusProps) {
             <Text color={COLOR.bright}>{deviceName}</Text>
             <Text dimColor> · </Text>
             <Text dimColor>{truncate(title, 24)}</Text>
+            {playing && status?.positionSec !== undefined ? (
+              <>
+                <Text dimColor> · </Text>
+                <Text color={COLOR.alt}>
+                  {clock(status.positionSec)}
+                  {status.durationSec ? <Text dimColor>/{clock(status.durationSec)}</Text> : null}
+                </Text>
+              </>
+            ) : null}
           </>
         ) : null}
       </Text>

@@ -124,10 +124,14 @@ export interface CastDevice {
 
 // Lifecycle of a cast, surfaced to the UI. "preparing" covers resolve+probe;
 // "transcoding" is the HLS remux buffering ahead; "playing" once the helper
-// spawns; "failed" when anything in the chain throws.
+// spawns; "failed" when anything in the chain throws. positionSec/durationSec
+// ride along for the footer's now-playing readout once the receiver reports
+// them.
 export type CastStatus = {
   state: "preparing" | "transcoding" | "playing" | "failed";
   detail?: string;
+  positionSec?: number;
+  durationSec?: number;
 };
 
 export type CastStatusSink = (status: CastStatus) => void;
@@ -445,8 +449,17 @@ function castViaHelper(
             const line = buffer.slice(0, idx).trim();
             buffer = buffer.slice(idx + 1);
             if (!line.startsWith("POS:")) continue;
-            const pos = Number(line.slice(4));
-            if (Number.isFinite(pos)) lastPosition = startSec + pos;
+            // POS:<elapsed>[:<duration>] — duration rides along when the
+            // receiver reports it.
+            const parts = line.slice(4).split(":");
+            const pos = Number(parts[0]);
+            if (!Number.isFinite(pos)) continue;
+            lastPosition = startSec + pos;
+            onStatus?.({
+              state: "playing",
+              positionSec: lastPosition,
+              ...(parts[1] ? { durationSec: startSec + Number(parts[1]) } : {}),
+            });
           }
         });
         const code = await new Promise<number | null>((resolve) => {
@@ -507,6 +520,21 @@ export function castSeek(deltaSec: number, opts?: { absolute?: boolean }): void 
   if (!activeAirplayCast) return;
   pendingSeek = opts?.absolute ? Math.max(0, deltaSec) : Math.max(0, lastPosition + deltaSec);
   activeAirplayCast.helper?.kill("SIGTERM");
+}
+
+// Pause or resume the active AirPlay cast. Control-plane side call: the
+// helper's play session stays alive; this just sends the remote command.
+// Best-effort — the helper treats failure as exit 0.
+export function castPauseResume(action: "pause" | "resume"): void {
+  const cast = activeAirplayCast;
+  if (!cast) return;
+  try {
+    const proc = spawn(cast.pyBin, [cast.helperScript, action, cast.id], {
+      stdio: "ignore", detached: true, env: cast.env,
+    });
+    proc.on("error", () => {});
+    proc.unref();
+  } catch {}
 }
 
 export function startCastDiscovery(

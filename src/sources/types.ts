@@ -8,9 +8,10 @@ export type SourceId =
   | "tpb-tv"
   | "x1337-movies"
   | "x1337-tv"
-  | "bittorrented";
+  | "bittorrented"
+  | "skwirll";
 
-export type SourceGroup = "Games" | "Movies" | "TV" | "Anime";
+export type SourceGroup = "New Releases" | "Games" | "Movies" | "TV" | "Anime";
 
 export interface TorrentResult {
   infoHash: string;

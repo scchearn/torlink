@@ -12,6 +12,7 @@ import { stickCursor, wrapStep, windowStart, resultsPanelOuter } from "../move";
 import { sortResults, nextSort, sortLabel, sortArrow, type Sort, type SortField } from "../sort";
 import { dedupeResults } from "../dedupe";
 import { filterResults } from "../filter";
+import { browseTitles, type NewReleaseTitle } from "../../sources/skwirll";
 import { COLOR, GUTTER, ICON, sourceStyle } from "../theme";
 import { cleanText, formatBytes, formatCount, formatRelative, stripControl, truncate } from "../../util/format";
 import type { Source, TorrentResult } from "../../sources/types";
@@ -121,6 +122,7 @@ export function Results() {
     query,
     submitQuery,
     section,
+    setSection,
     region,
     setRegion,
     setCaptureMode,
@@ -157,6 +159,35 @@ export function Results() {
   const selRef = useRef<string | null>(null);
   const [detail, setDetail] = useState<TorrentResult | null>(null);
 
+  // New Releases browse: the tab lists unique movies (title rows); Enter
+  // drills into a real torrent search for that title in the Movies section.
+  // `drilled` marks that state so esc walks back to the title list.
+  const newBrowse = section === "new" && query.trim() === "";
+  const [drilled, setDrilled] = useState(false);
+  // The drill-down itself changes query+section, which trips the reset effect
+  // below; this latch tells the effect "this change is the drill-down, keep
+  // the flag". Set just before submitQuery, consumed by the effect.
+  const drillingRef = useRef(false);
+  const [titles, setTitles] = useState<NewReleaseTitle[] | null>(null);
+  const [titlesLoading, setTitlesLoading] = useState(false);
+  useEffect(() => {
+    if (!newBrowse) {
+      setTitles(null);
+      return;
+    }
+    let alive = true;
+    setTitlesLoading(true);
+    void browseTitles().then((t) => {
+      if (alive) {
+        setTitles(t);
+        setTitlesLoading(false);
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, [newBrowse]);
+
   useEffect(() => {
     setCursor((c) => stickCursor(results, selRef.current, c));
   }, [results]);
@@ -165,13 +196,28 @@ export function Results() {
     selRef.current = null;
     setCursor(0);
     setTextFilter("");
+    // A manual query change (typing a new search) ends the drill-down — but
+    // the drill-down's own query/section change must keep it.
+    if (drillingRef.current) {
+      drillingRef.current = false;
+    } else {
+      setDrilled(false);
+    }
   }, [query, section]);
 
   useEffect(() => {
     if (!focused) return;
-    setCaptureMode(mode === "search" || mode === "filter" ? "text" : mode === "detail" ? "esc" : "none");
+    // Drilled list mode also captures esc: the keypress walks back to the
+    // New Releases title list instead of App's focus-to-sidebar escape.
+    setCaptureMode(
+      mode === "search" || mode === "filter"
+        ? "text"
+        : mode === "detail" || (mode === "list" && drilled)
+          ? "esc"
+          : "none",
+    );
     return () => setCaptureMode("none");
-  }, [mode, focused, setCaptureMode]);
+  }, [mode, focused, drilled, setCaptureMode]);
 
   useEffect(() => {
     if (!focused) setMode("list");
@@ -217,8 +263,59 @@ export function Results() {
     selRef.current = results[n]?.infoHash ?? null;
   };
 
+  // New Releases title list navigation mirrors the torrent list, keyed by
+  // IMDb id instead of infohash.
+  const titleCount = titles?.length ?? 0;
+  const moveTitle = (n: number): void => {
+    setCursor(n);
+    selRef.current = titles?.[n]?.imdb ?? null;
+  };
+
   useInput(
     (input, key) => {
+      // Drilled into a title's torrents: esc walks back to the title list.
+      if (drilled && key.escape) {
+        setDrilled(false);
+        submitQuery("");
+        setSection("new");
+        return;
+      }
+      if (newBrowse) {
+        if (input === "/") {
+          setMode("search");
+          return;
+        }
+        if (key.upArrow || input === "k") {
+          if (titleCount > 0 && clamped > 0) moveTitle(clamped - 1);
+          else setMode("search");
+          return;
+        }
+        if (key.downArrow || input === "j") {
+          if (titleCount > 0) moveTitle(wrapStep(clamped, 1, titleCount));
+          return;
+        }
+        if (key.pageUp) {
+          moveTitle(Math.max(0, clamped - pageJump));
+          return;
+        }
+        if (key.pageDown) {
+          moveTitle(Math.min(Math.max(0, titleCount - 1), clamped + pageJump));
+          return;
+        }
+        if (key.return) {
+          const t = titles?.[clamped];
+          if (t) {
+            // Drill into a real torrent search for this title across the
+            // Movies sources. Esc from there walks back to this list.
+            setDrilled(true);
+            drillingRef.current = true;
+            submitQuery(t.title);
+            setSection("movies");
+          }
+          return;
+        }
+        return;
+      }
       if (input === "/") {
         setMode("search");
         return;
@@ -399,7 +496,13 @@ export function Results() {
 
   const start = windowStart(clamped, results.length, listHeight);
   const visible = results.slice(start, start + listHeight);
-  const count = results.length > 0 ? `(${results.length})` : undefined;
+  const count = newBrowse
+    ? (titles?.length ?? 0) > 0
+      ? `(${titles!.length})`
+      : undefined
+    : results.length > 0
+      ? `(${results.length})`
+      : undefined;
 
   return (
     <Box flexDirection="column">
@@ -414,7 +517,7 @@ export function Results() {
       />
       <Box marginTop={1}>
         <Panel
-          title={mode === "detail" ? "details" : browsing ? "latest" : "results"}
+          title={mode === "detail" ? "details" : newBrowse ? "new releases" : browsing ? "latest" : "results"}
           width={contentWidth}
           focused={focused && mode !== "search"}
           count={mode === "detail" ? undefined : count}
@@ -422,6 +525,75 @@ export function Results() {
         >
           {mode === "detail" && detail ? (
             <Detail r={detail} width={Math.max(10, contentWidth - 4)} />
+          ) : newBrowse ? (
+            <>
+              <Box>
+                {titlesLoading ? (
+                  <Spinner label="loading scene releases…" />
+                ) : (titles?.length ?? 0) === 0 ? (
+                  <Text dimColor>Nothing new this week.</Text>
+                ) : (
+                  <Text dimColor>{`${titles!.length} new releases this week · ↵ opens torrents`}</Text>
+                )}
+              </Box>
+              {(titles?.length ?? 0) > 0 ? (
+                <Box flexDirection="column" marginTop={1}>
+                  <Box>
+                    <Box width={GUTTER} flexShrink={0} />
+                    <Box width={numW} flexShrink={0} justifyContent="flex-end">
+                      <Text bold dimColor>#</Text>
+                    </Box>
+                    <Box flexGrow={1} minWidth={0} marginLeft={1}>
+                      <Text bold dimColor>Title</Text>
+                    </Box>
+                    <Box width={9} flexShrink={0} marginLeft={1} justifyContent="flex-end">
+                      <Text bold dimColor>Seeders</Text>
+                    </Box>
+                    <Box width={12} flexShrink={0} marginLeft={1} justifyContent="flex-end">
+                      <Text bold dimColor>Added</Text>
+                    </Box>
+                  </Box>
+                  {titles!.slice(start, start + listHeight).map((t, i) => {
+                    const index = start + i;
+                    const here = index === clamped && focused && mode === "list";
+                    return (
+                      <Box key={t.imdb}>
+                        <Box width={GUTTER} flexShrink={0}>
+                          <Text color={COLOR.accent}>{here ? ICON.pointer : ""}</Text>
+                        </Box>
+                        <Box width={numW} flexShrink={0} justifyContent="flex-end">
+                          <Text dimColor>{index + 1}</Text>
+                        </Box>
+                        <Box flexGrow={1} minWidth={0} marginLeft={1}>
+                          <Text
+                            wrap="truncate-end"
+                            color={here ? COLOR.accent : undefined}
+                            dimColor={!here}
+                            bold={here}
+                          >
+                            {cleanText(t.title)}
+                          </Text>
+                        </Box>
+                        <Box width={9} flexShrink={0} marginLeft={1} justifyContent="flex-end">
+                          <Text
+                            color={t.seeders > 0 ? COLOR.good : undefined}
+                            dimColor={!here}
+                            bold={here}
+                          >
+                            {formatCount(t.seeders)}
+                          </Text>
+                        </Box>
+                        <Box width={12} flexShrink={0} marginLeft={1} justifyContent="flex-end">
+                          <Text dimColor={!here} bold={here}>
+                            {formatRelative(t.addedAt) || "-"}
+                          </Text>
+                        </Box>
+                      </Box>
+                    );
+                  })}
+                </Box>
+              ) : null}
+            </>
           ) : (
             <>
               <Box>{status()}</Box>
