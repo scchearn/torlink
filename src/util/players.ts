@@ -193,25 +193,50 @@ export type AirplayPlan =
 // `url` may be an http URL or a local file path (multi-file torrents resolve to an .m3u path).
 // The plan is capability-aware: copy what the target decodes natively, encode
 // the rest, and force 8-bit output only when the target needs it.
+//
+// Video copy has one hard precondition: the audio must ALSO be copyable
+// (AAC-LC, HLS-compatible sample rate). When video is copied but audio is
+// transcoded, each runner window's `-ss` becomes asymmetric: transcoded audio
+// decode-discards to the exact seek point while stream-copied video can only
+// start at the source keyframe <= that point — measured 2.2s desync on a
+// typical rip whose GOPs run 2.75-10s (Jellyfin #9330 bug class), different
+// on every seek. Encoding video avoids the asymmetry entirely: decode-accurate
+// cutting aligns both streams to the same instant (verified <=23ms, AAC
+// priming).
 export function airplayPlan(
   url: string,
   vcodec: string | null,
   pixFmt: string | null,
   caps: CastCapabilities,
+  audio: {
+    codec: string | null;
+    profile: string | null;
+    sampleRate: number | null;
+    channels: number | null;
+  } | null,
 ): AirplayPlan {
   if (/\.(mp4|m4v|mov)$/i.test(url)) return { mode: "direct" };
   if (vcodec === null) return { mode: "direct" }; // ponytail: probe failed, try direct and hope
+  const audioCopyable =
+    audio?.codec === "aac" &&
+    audio.profile !== "HE-AAC" &&
+    audio.sampleRate !== null &&
+    audio.sampleRate <= 48000 &&
+    audio.channels !== null &&
+    audio.channels <= 6;
   const tenBit = pixFmt?.includes("10le") ?? false;
   if (vcodec === "h264" && !(tenBit && !caps.can10bit)) {
-    return { mode: "transcode", video: "copy", pixFmt: "copy" };
+    // Copy only when the audio rides along untouched; otherwise encode both.
+    return { mode: "transcode", video: audioCopyable ? "copy" : "encode", pixFmt: "copy" };
   }
-  if (vcodec === "hevc" && caps.canHevc) {
+  if (vcodec === "hevc" && caps.canHevc && audioCopyable) {
     // HEVC requires fmp4 segments; the capability table only grants canHevc
     // when the target also accepts fmp4.
     return { mode: "transcode", video: "copy", pixFmt: "copy" };
   }
-  // Foreign codec (or 10-bit on an 8-bit target): re-encode, downconverting
-  // depth when the target can't do 10-bit.
+  // Foreign codec (or 10-bit on an 8-bit target), or copy-video whose audio
+  // would need transcoding: re-encode, downconverting depth when the target
+  // can't do 10-bit.
   return { mode: "transcode", video: "encode", pixFmt: tenBit && !caps.can10bit ? "yuv420p" : "copy" };
 }
 
@@ -224,13 +249,23 @@ interface ProbedStream {
   pixFmt: string | null;
   durationSec: number | null;
   audioLangs: string[]; // per audio stream, language tag or ""
+  audio: {
+    codec: string | null;
+    profile: string | null;
+    sampleRate: number | null;
+    channels: number | null;
+  } | null;
 }
 
 function probeStreams(url: string): Promise<ProbedStream | null> {
   return new Promise((resolve) => {
     execFile(
       "ffprobe",
-      ["-v", "error", "-show_entries", "stream=codec_name,codec_type,pix_fmt:stream_tags=language:format=duration", "-of", "json", url],
+      [
+        "-v", "error",
+        "-show_entries", "stream=codec_name,codec_type,pix_fmt,profile,sample_rate,channels:stream_tags=language:format=duration",
+        "-of", "json", url,
+      ],
       { timeout: 15000 },
       (err, stdout) => {
         if (err) return resolve(null);
@@ -239,6 +274,7 @@ function probeStreams(url: string): Promise<ProbedStream | null> {
           const streams = parsed.streams ?? [];
           const duration = Number(parsed.format?.duration);
           const video = streams.find((s: { codec_type?: string }) => s.codec_type === "video");
+          const audio = streams.find((s: { codec_type?: string }) => s.codec_type === "audio");
           resolve({
             vcodec: video?.codec_name ?? null,
             pixFmt: video?.pix_fmt ?? null,
@@ -246,6 +282,14 @@ function probeStreams(url: string): Promise<ProbedStream | null> {
             audioLangs: streams
               .filter((s: { codec_type?: string }) => s.codec_type === "audio")
               .map((s: { tags?: { language?: string } }) => s.tags?.language ?? ""),
+            audio: audio
+              ? {
+                  codec: audio.codec_name ?? null,
+                  profile: audio.profile ?? null,
+                  sampleRate: Number(audio.sample_rate) || null,
+                  channels: Number(audio.channels) || null,
+                }
+              : null,
           });
         } catch {
           resolve(null);
@@ -413,7 +457,7 @@ function castViaHelper(
       const fileUrl = await resolveFileUrl(castUrl, ip ?? "127.0.0.1");
       const probe = await probeStreams(fileUrl);
       const caps = capsForDevice("airplay", model);
-      const plan = airplayPlan(fileUrl, probe?.vcodec ?? null, probe?.pixFmt ?? null, caps);
+      const plan = airplayPlan(fileUrl, probe?.vcodec ?? null, probe?.pixFmt ?? null, caps, probe?.audio ?? null);
       const langs = probe?.audioLangs ?? [];
       const duration = probe?.durationSec ?? null;
 

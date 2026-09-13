@@ -5,44 +5,68 @@ import { airplayPlan, buildVarStreamMap, capsForDevice, findHelperScript } from 
 const ATV_HD = capsForDevice("airplay", "DeviceModel.Gen4");
 const ATV_4K = capsForDevice("airplay", "DeviceModel.Gen4K");
 
+// Copyable audio: AAC-LC, sane rate, HLS-compatible channel count.
+const AAC = { codec: "aac", profile: "LC", sampleRate: 48000, channels: 2 };
+const DDP = { codec: "eac3", profile: null, sampleRate: 48000, channels: 6 };
+const HE_AAC = { codec: "aac", profile: "HE-AAC", sampleRate: 48000, channels: 2 };
+
 describe("airplayPlan", () => {
   it("direct for tvOS-native containers regardless of codec", () => {
-    expect(airplayPlan("http://x/video.mp4", "mpeg2video", null, ATV_HD)).toEqual({ mode: "direct" });
-    expect(airplayPlan("/tmp/movie.M4V", null, null, ATV_HD)).toEqual({ mode: "direct" });
+    expect(airplayPlan("http://x/video.mp4", "mpeg2video", null, ATV_HD, AAC)).toEqual({ mode: "direct" });
+    expect(airplayPlan("/tmp/movie.M4V", null, null, ATV_HD, AAC)).toEqual({ mode: "direct" });
   });
 
-  it("remux (copy) when the target decodes the source natively", () => {
-    expect(airplayPlan("http://x/movie.mkv", "h264", "yuv420p", ATV_HD)).toEqual({
+  it("remux (copy) when the target decodes the source natively AND the audio is copyable", () => {
+    expect(airplayPlan("http://x/movie.mkv", "h264", "yuv420p", ATV_HD, AAC)).toEqual({
       mode: "transcode", video: "copy", pixFmt: "copy",
     });
   });
 
-  it("re-encodes hevc for 8-bit-only targets but copies for HEVC-capable ones", () => {
-    expect(airplayPlan("http://x/movie.mkv", "hevc", "yuv420p10le", ATV_HD)).toEqual({
+  it("encodes video when the audio would need transcoding — copy+transcode desyncs per-window", () => {
+    // DDP5.1 / HE-AAC audio can't ride along; video copy would desync by up to
+    // a GOP on every seek (measured 2.2s on a real rip).
+    expect(airplayPlan("http://x/movie.mkv", "h264", "yuv420p", ATV_HD, DDP)).toEqual({
+      mode: "transcode", video: "encode", pixFmt: "copy",
+    });
+    expect(airplayPlan("http://x/movie.mkv", "h264", "yuv420p", ATV_HD, HE_AAC)).toEqual({
+      mode: "transcode", video: "encode", pixFmt: "copy",
+    });
+    // Unknown audio: assume not copyable, encode.
+    expect(airplayPlan("http://x/movie.mkv", "h264", "yuv420p", ATV_HD, null)).toEqual({
+      mode: "transcode", video: "encode", pixFmt: "copy",
+    });
+  });
+
+  it("re-encodes hevc for 8-bit-only targets but copies for HEVC-capable ones with copyable audio", () => {
+    expect(airplayPlan("http://x/movie.mkv", "hevc", "yuv420p10le", ATV_HD, AAC)).toEqual({
       mode: "transcode", video: "encode", pixFmt: "yuv420p",
     });
-    expect(airplayPlan("http://x/movie.mkv", "hevc", "yuv420p10le", ATV_4K)).toEqual({
+    expect(airplayPlan("http://x/movie.mkv", "hevc", "yuv420p10le", ATV_4K, AAC)).toEqual({
       mode: "transcode", video: "copy", pixFmt: "copy",
+    });
+    // HEVC copy also requires copyable audio.
+    expect(airplayPlan("http://x/movie.mkv", "hevc", "yuv420p10le", ATV_4K, DDP)).toEqual({
+      mode: "transcode", video: "encode", pixFmt: "copy",
     });
   });
 
   it("downconverts 10-bit h264 on 8-bit-only targets, copies on capable ones", () => {
-    expect(airplayPlan("http://x/anime.mkv", "h264", "yuv420p10le", ATV_HD)).toEqual({
+    expect(airplayPlan("http://x/anime.mkv", "h264", "yuv420p10le", ATV_HD, AAC)).toEqual({
       mode: "transcode", video: "encode", pixFmt: "yuv420p",
     });
-    expect(airplayPlan("http://x/anime.mkv", "h264", "yuv420p10le", ATV_4K)).toEqual({
+    expect(airplayPlan("http://x/anime.mkv", "h264", "yuv420p10le", ATV_4K, AAC)).toEqual({
       mode: "transcode", video: "copy", pixFmt: "copy",
     });
   });
 
   it("re-encodes foreign codecs (vp9/av1/mpeg2) regardless of target", () => {
-    expect(airplayPlan("http://x/movie.mkv", "vp9", "yuv420p", ATV_4K)).toEqual({
+    expect(airplayPlan("http://x/movie.mkv", "vp9", "yuv420p", ATV_4K, AAC)).toEqual({
       mode: "transcode", video: "encode", pixFmt: "copy",
     });
   });
 
   it("direct when probe fails (best effort)", () => {
-    expect(airplayPlan("http://x/movie.mkv", null, null, ATV_HD)).toEqual({ mode: "direct" });
+    expect(airplayPlan("http://x/movie.mkv", null, null, ATV_HD, AAC)).toEqual({ mode: "direct" });
   });
 });
 

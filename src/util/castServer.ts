@@ -97,6 +97,14 @@ function freePort(): Promise<number> {
 // inaudible). Segments [fromSeg, toSeg), cut at exact 2s boundaries; exits on
 // its own at the window end.
 //
+// Audio sync is maintained by aresample=async=1000:first_pts=0: our CFR grid
+// (fps=24) never exactly matches movie sources (23.976fps = 0.1% timeline
+// mismatch ≈ 0.1s drift per 100s). async=1 only corrects via hard
+// fill/trim gated at 100ms (libswresample min_hard_comp) — audible hiccups
+// that grow before each correction. async=1000 instead stretches/squeezes
+// continuously at ≤ ~21ms/sec, inaudible, and first_pts=0 keeps the window
+// head on the segment grid.
+//
 // Variant layout: ffmpeg numbers variants in var_stream_map order — video
 // first (dir "0"), then audio track i (dir "i+1"). The master playlist and
 // the server's request routing use the same mapping.
@@ -127,7 +135,7 @@ function spawnRunner(plan: SegmentPlan, dir: string, fromSeg: number, toSeg: num
     args.push("-force_key_frames", `expr:gte(t,n_forced*${SEGMENT_SEC})`);
     args.push("-c:v", "libx264", "-preset", "veryfast");
   }
-  args.push("-af", "aresample=async=1:first_pts=0");
+  args.push("-af", "aresample=async=1000:first_pts=0");
   args.push("-c:a", "aac", "-b:a", "192k", "-ac", "2");
   const ext = plan.segmentType === "fmp4" ? "m4s" : "ts";
   args.push(
