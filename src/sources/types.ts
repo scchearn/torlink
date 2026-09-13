@@ -23,6 +23,9 @@ export interface TorrentResult {
   source: SourceId;
   magnet: string;
   added?: number;
+  // Present on New Releases rows: the IMDb id the discovery layer resolved,
+  // so the title list can group/dedupe without re-resolving.
+  imdbId?: string;
 }
 
 export interface SearchOptions {

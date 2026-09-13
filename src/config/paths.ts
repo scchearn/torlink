@@ -27,6 +27,10 @@ export const seedsFile = path.join(dataDir, "seeds.json");
 // verify the on-disk file locally instead of re-fetching it from the swarm.
 export const torrentsDir = path.join(dataDir, "torrents");
 
+// Skwirll's per-IMDb swarm-heat and TMDB title caches, persisted so the New
+// Releases feed's expensive fan-outs survive restarts.
+export const sourceCacheFile = path.join(dataDir, "source-cache.json");
+
 // Armed just before boot hands saved state to the torrent engine, disarmed
 // once the boot settles; see download/bootguard.ts.
 export const bootMarkerFile = path.join(dataDir, "boot.marker");

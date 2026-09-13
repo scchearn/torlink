@@ -1,4 +1,7 @@
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { fetchResilient, HttpError, USER_AGENT } from "../util/net";
+import { sourceCacheFile } from "../config/paths";
 import { buildMagnet } from "./magnet";
 import type { SearchOptions, Source, SourceId, TorrentResult } from "./types";
 
@@ -35,6 +38,66 @@ const MOVIE = "MOVIE";
 // list but sink below everything untagged.
 const DUB_MARKERS = /\b(german|polish|italian|french|dutch|spanish|dublado|danish|swedish|norwegian|finnish|multi)\b/i;
 
+// --- YTS recent uploads (second discovery layer) ---
+//
+// The scene predb only sees releases that went through scene pre — P2P web
+// releases (the first WEB-DLs of big titles) never do and were invisible to
+// the feed. YTS's newest uploads are the complementary signal: YTS curates a
+// handful of uploads per day, they become the site's "Popular Downloads", and
+// every movie carries an imdb_code.
+const YTS_HOSTS = ["yts.mx", "yts.am", "yts.rs", "yts.bz", "yts.gg"];
+// Five pages covers ~7 days of YTS uploads with burst margin (measured
+// 2026-09: 150 uploads ≈ 7 days at the typical rate); the 7-day discovery
+// window must stay honest even when upload volume spikes, so a P2P release
+// uploaded on day 6 isn't cut off.
+const YTS_PAGES = 5;
+
+interface YtsMovie {
+  imdb_code?: string;
+  title_long?: string;
+  title?: string;
+  year?: number;
+  date_uploaded_unix?: number;
+  torrents?: Array<{ hash?: string; seeds?: number; peers?: number; size_bytes?: number }>;
+}
+
+// Pages are identical for minutes; cache the merged list with a timestamp.
+const ytsCache = new Map<string, { at: number; movies: YtsMovie[] }>();
+const YTS_TTL_MS = 30 * 60 * 1000;
+const YTS_CACHE_KEY = "recent";
+
+async function fetchYtsRecent(opts: SearchOptions): Promise<YtsMovie[]> {
+  const entry = ytsCache.get(YTS_CACHE_KEY);
+  if (entry && Date.now() - entry.at < YTS_TTL_MS) return entry.movies;
+  let lastError: unknown = null;
+  for (const host of YTS_HOSTS) {
+    try {
+      const pages = await Promise.all(
+        Array.from({ length: YTS_PAGES }, (_, p) =>
+          fetchResilient(
+            `https://${host}/api/v2/list_movies.json?limit=50&page=${p + 1}&sort_by=date_added&order_by=desc`,
+            { headers: { "User-Agent": USER_AGENT }, signal: opts.signal, retries: 1 },
+          ).then((res) => {
+            if (!res.ok) throw new HttpError(res.status, `YTS returned ${res.status}`);
+            return (res.json() as Promise<{ data?: { movies?: YtsMovie[] } }>).then(
+              (j) => j.data?.movies ?? [],
+            );
+          }),
+        ),
+      );
+      const merged = pages.flat();
+      ytsCache.set(YTS_CACHE_KEY, { at: Date.now(), movies: merged });
+      return merged;
+    } catch (e) {
+      if (opts.signal?.aborted) throw e;
+      lastError = e;
+    }
+  }
+  // All YTS hosts down: the scene feed alone still populates the view.
+  void lastError;
+  return ytsCache.get(YTS_CACHE_KEY)?.movies ?? [];
+}
+
 interface ImdbEntry {
   at: number;
   seeders: number;
@@ -49,8 +112,10 @@ interface ImdbEntry {
 
 // Swarm heat changes slowly; a per-IMDb cache (with the winning apibay row
 // attached) keeps repeated views cheap and stays far inside apibay's
-// patience. 30 min TTL, bounded — one map, one eviction path, no races
-// between a seeders map and a rows map.
+// patience. 30 min TTL for freshness, but entries are PERSISTED to disk so a
+// restart doesn't re-pay the fan-out: on load, entries older than the TTL are
+// kept as row-data (hash/name/size) with seeders marked stale — they render
+// instantly and refresh on the next view.
 const imdbCache = new Map<string, ImdbEntry>();
 const SEEDERS_TTL_MS = 30 * 60 * 1000;
 const IMDB_CACHE_MAX = 500;
@@ -72,7 +137,7 @@ const VIEW_TTL_MS = 15 * 60 * 1000;
 // cold view (~150 round-trips × 0.9s), while unbounded bursts risk rate
 // limiting. Eight at a time keeps a 150-title cold view around 30s and warm
 // views instant via the caches.
-const APIBAY_CONCURRENCY = 8;
+const APIBAY_CONCURRENCY = 16;
 let apibayActive = 0;
 const apibayWaiters: Array<() => void> = [];
 
@@ -152,6 +217,7 @@ async function seedersForImdb(imdb: string, opts: SearchOptions): Promise<ImdbEn
         if (oldest === undefined) break;
         imdbCache.delete(oldest);
       }
+      schedulePersist();
       return entry;
     } catch {
       // apibay down or rate-limited: report unknown heat rather than killing
@@ -196,6 +262,53 @@ interface TmdbTitle {
 
 const tmdbCache = new Map<string, TmdbTitle | null>();
 const TMDB_CACHE_MAX = 1000;
+
+// --- Disk persistence for the expensive caches ---
+//
+// The apibay fan-out and TMDB resolution are the New Releases feed's cold
+// cost. Both maps persist to source-cache.json: loaded at module init,
+// saved debounced after mutations. IMDb entries survive with their row data
+// (seeders re-verified on next use); TMDB titles are permanent by nature.
+// Skwirll day responses and the ranked view stay in-memory — they're cheap
+// to rebuild and go stale fast.
+interface PersistedCache {
+  imdb?: Array<[string, ImdbEntry]>;
+  tmdb?: Array<[string, TmdbTitle | null]>;
+}
+
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+
+function schedulePersist(): void {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    try {
+      const payload: PersistedCache = {
+        imdb: [...imdbCache.entries()].slice(0, IMDB_CACHE_MAX),
+        tmdb: [...tmdbCache.entries()].slice(0, TMDB_CACHE_MAX),
+      };
+      mkdirSync(path.dirname(sourceCacheFile), { recursive: true });
+      writeFileSync(sourceCacheFile, JSON.stringify(payload));
+    } catch {
+      // Persistence is best-effort; the in-memory caches still work.
+    }
+  }, 2000);
+}
+
+function loadPersisted(): void {
+  try {
+    const raw = JSON.parse(readFileSync(sourceCacheFile, "utf8")) as PersistedCache;
+    for (const [id, entry] of raw.imdb ?? []) {
+      if (entry && typeof entry === "object") imdbCache.set(id, entry);
+    }
+    for (const [id, title] of raw.tmdb ?? []) {
+      tmdbCache.set(id, title ?? null);
+    }
+  } catch {
+    // First run or corrupt file: start empty.
+  }
+}
+loadPersisted();
 let tmdbKey = "";
 
 export function setTmdbKey(key: string): void {
@@ -220,7 +333,7 @@ async function resolveTitles(imdbIds: string[], opts: SearchOptions): Promise<Ma
 
   // Bounded concurrency, same shape as the apibay fan-out.
   let idx = 0;
-  const workers = Array.from({ length: Math.min(4, pending.length) }, async () => {
+  const workers = Array.from({ length: Math.min(10, pending.length) }, async () => {
     for (;;) {
       const id = pending[idx++];
       if (id === undefined) return;
@@ -256,6 +369,7 @@ async function resolveTitles(imdbIds: string[], opts: SearchOptions): Promise<Ma
           if (oldest === undefined) break;
           tmdbCache.delete(oldest);
         }
+        schedulePersist();
       } catch {
         // Network/key failure: null caches the miss; the scene-name fallback
         // covers this row.
@@ -278,9 +392,14 @@ export async function newReleases(opts: SearchOptions = {}): Promise<TorrentResu
   if (viewCache && Date.now() - viewCache.at < VIEW_TTL_MS) return viewCache.results;
 
   const days = Array.from({ length: WINDOW_DAYS }, (_, i) => pastIso(i));
-  const perDay = await Promise.all(days.map((d) => fetchDay(d, opts)));
+  const [perDay, ytsMovies] = await Promise.all([
+    Promise.all(days.map((d) => fetchDay(d, opts))),
+    fetchYtsRecent(opts).catch(() => [] as YtsMovie[]),
+  ]);
 
-  // Dedupe by IMDb keeping the FIRST sighting (when the release dropped).
+  // Discovery union, deduped by IMDb keeping the FIRST sighting:
+  // scene predb releases + YTS's newest uploads (which carry P2P web
+  // releases the scene feed never sees).
   const byImdb = new Map<string, SkwirllRelease>();
   for (const releases of perDay) {
     for (const r of releases) {
@@ -289,10 +408,34 @@ export async function newReleases(opts: SearchOptions = {}): Promise<TorrentResu
       if (!existing || (r.created_at ?? 0) < (existing.created_at ?? 0)) byImdb.set(r.imdb_id, r);
     }
   }
+  // YTS-side fallback rows: when apibay can't answer for a title, the YTS
+  // upload itself carries a real hash + swarm counts, so the row survives
+  // (with YTS's own torrent data) instead of being dropped.
+  const ytsFallback = new Map<string, { hash: string; seeds: number; peers: number; size: number }>();
+  for (const m of ytsMovies) {
+    const imdb = m.imdb_code;
+    if (!imdb) continue;
+    const torrent = (m.torrents ?? []).find((t) => t.hash);
+    if (torrent?.hash) {
+      ytsFallback.set(imdb, {
+        hash: torrent.hash.toLowerCase(),
+        seeds: torrent.seeds ?? 0,
+        peers: torrent.peers ?? 0,
+        size: torrent.size_bytes ?? 0,
+      });
+    }
+    if (byImdb.has(imdb)) continue;
+    byImdb.set(imdb, {
+      name: m.title_long ?? m.title ?? "",
+      category: MOVIE,
+      imdb_id: imdb,
+      created_at: m.date_uploaded_unix,
+    });
+  }
 
   // Rank: best apibay seeder count per IMDb, descending. Unknown heat (-1)
-  // sorts last and is dropped (no magnet to attach). Dubs sink below
-  // untagged releases of equal heat.
+  // falls back to the YTS torrent's own counts; rows with neither are
+  // dropped. Dubs sink below untagged releases of equal heat.
   const scored = await Promise.all(
     [...byImdb.entries()].map(async ([imdb, r]) => ({
       imdb,
@@ -304,20 +447,38 @@ export async function newReleases(opts: SearchOptions = {}): Promise<TorrentResu
     const dubA = DUB_MARKERS.test(a.r.name!) ? 1 : 0;
     const dubB = DUB_MARKERS.test(b.r.name!) ? 1 : 0;
     if (dubA !== dubB) return dubA - dubB;
-    return b.entry.seeders - a.entry.seeders;
+    const seedsA = a.entry.seeders >= 0 ? a.entry.seeders : (ytsFallback.get(a.imdb)?.seeds ?? -1);
+    const seedsB = b.entry.seeders >= 0 ? b.entry.seeders : (ytsFallback.get(b.imdb)?.seeds ?? -1);
+    return seedsB - seedsA;
   });
 
   // Canonical titles via TMDB (no-op without a key; scene-name fallback then).
   const names = await resolveTitles(
-    scored.filter((s) => s.entry.seeders >= 0).map((s) => s.imdb),
+    scored.filter((s) => s.entry.seeders >= 0 || ytsFallback.has(s.imdb)).map((s) => s.imdb),
     opts,
   );
 
   const out: TorrentResult[] = [];
   for (const { imdb, r, entry } of scored) {
-    if (entry.seeders < 0 || !entry.row?.info_hash) continue;
-    const infoHash = entry.row.info_hash.toLowerCase();
     const display = displayName(r.name!, names.get(imdb));
+    const yts = ytsFallback.get(imdb);
+    if (entry.seeders < 0 || !entry.row?.info_hash) {
+      // apibay had nothing: use the YTS torrent as the row if present.
+      if (!yts) continue;
+      out.push({
+        infoHash: yts.hash,
+        name: display || r.name!,
+        sizeBytes: yts.size,
+        seeders: yts.seeds,
+        leechers: yts.peers,
+        source: "skwirll",
+        magnet: buildMagnet(yts.hash, r.name!, []),
+        added: r.created_at,
+        imdbId: imdb,
+      });
+      continue;
+    }
+    const infoHash = entry.row.info_hash.toLowerCase();
     out.push({
       infoHash,
       name: display || r.name!,
@@ -327,6 +488,7 @@ export async function newReleases(opts: SearchOptions = {}): Promise<TorrentResu
       source: "skwirll",
       magnet: buildMagnet(infoHash, entry.row.name || display, []),
       added: Number(entry.row.added) || r.created_at,
+      imdbId: imdb,
     });
   }
   viewCache = { at: Date.now(), results: out };
@@ -341,38 +503,21 @@ export interface NewReleaseTitle {
 }
 
 // Title-level view for the New Releases tab: one row per unique movie, ranked
-// by swarm heat. Shares the same caches as newReleases, so switching between
-// the tab and a drilled-down torrent search costs nothing.
+// by swarm heat. Derived directly from newReleases' output — the discovery
+// union (scene feed + YTS uploads), ranking, and TMDB naming all live there,
+// so the title list can never disagree with the torrent rows beneath it.
 export async function browseTitles(opts: SearchOptions = {}): Promise<NewReleaseTitle[]> {
-  await newReleases(opts); // warm the shared caches
-  const days = Array.from({ length: WINDOW_DAYS }, (_, i) => pastIso(i));
-  const perDay = await Promise.all(days.map((d) => fetchDay(d, opts)));
-  const byImdb = new Map<string, SkwirllRelease>();
-  for (const releases of perDay) {
-    for (const r of releases) {
-      if (r.category !== MOVIE || !r.imdb_id || !r.name) continue;
-      const existing = byImdb.get(r.imdb_id);
-      if (!existing || (r.created_at ?? 0) < (existing.created_at ?? 0)) byImdb.set(r.imdb_id, r);
-    }
-  }
-  // Canonical titles for the rows the torrent lookup already confirmed.
-  const resolvable = [...byImdb.keys()].filter((imdb) => {
-    const e = imdbCache.get(imdb);
-    return e && e.seeders >= 0 && e.row?.info_hash;
-  });
-  const names = await resolveTitles(resolvable, opts);
+  const rows = await newReleases(opts);
   const titles: NewReleaseTitle[] = [];
-  for (const [imdb, r] of byImdb) {
-    const entry = imdbCache.get(imdb);
-    if (!entry || entry.seeders < 0 || !entry.row?.info_hash) continue; // no torrent source yet
+  for (const r of rows) {
+    if (!r.imdbId) continue;
     titles.push({
-      imdb,
-      title: displayName(r.name!, names.get(imdb)),
-      seeders: entry.seeders,
-      addedAt: Number(entry.row.added) || r.created_at,
+      imdb: r.imdbId,
+      title: r.name,
+      seeders: r.seeders,
+      addedAt: r.added,
     });
   }
-  titles.sort((a, b) => b.seeders - a.seeders);
   return titles;
 }
 
